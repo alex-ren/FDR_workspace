@@ -1,0 +1,438 @@
+
+-- Author: Zhiqiang Ren
+-- Date: 09/11/2012
+
+-- Specification
+datatype ConnId = nil | c1 | c2 | c3 -- finite no. of connection
+ConnSet = diff(ConnId, {nil})
+
+max_conn = card(ConnSet)
+assert max_conn > 0
+
+ThreadId = {1, 2, 3, 4}
+
+pool_size = 2 -- no. of connections to keep open
+ext_pool_size = max_conn - pool_size -- extras = 3 - 2 = 1
+queue_size = 2 -- no. of threads allowed to queue
+
+assert pool_size >= 0
+assert ext_pool_size >= 0
+
+datatype Response = ok | error | full
+
+channel call, enter, exit: ThreadId
+channel reject
+channel link: ThreadId.{ok, error} -- no "full" on link
+channel return: ThreadId.Response -- any poss. Response
+
+Thread(t) = call.t -> (reject -> return.t.full -> SKIP
+                       [] enter.t -> link.t?r ->
+                          exit.t -> return.t!r -> SKIP);
+                      Thread(t)
+
+Threads = ||| t: ThreadId @ Thread(t)
+
+Supervisor(active, queue) = 
+  empty(inter(active, set(queue))) and
+  card(active) < max_conn and
+  #queue <= queue_size and
+  (card(active) == max_conn or null(queue)) &
+  (if card(active) < max_conn
+   then enter?t -> Supervisor(union(active, {t}), queue)
+   else if #queue == queue_size -- full
+        then reject -> Supervisor(active, queue)
+        else enter?t -> Supervisor(active, queue^<t>))
+  []
+  ([]t: active@ -- active threads only
+        link.t?_ -> Supervisor(active, queue)
+        [] exit.t -> let
+             left = diff(active, {t}) 
+           within
+             if null(queue)
+             then Supervisor(left, queue)
+             else Supervisor(union(left, {head(queue)}),
+             tail(queue)))
+        
+
+PoolSpec = 
+  (Threads
+   [|{|enter, exit, reject, link|}|]
+   Supervisor({}, <>))
+  \ {|enter, exit, reject|}
+-- call, link, return
+
+assert PoolSpec :[ deadlock free[FD] ]
+assert PoolSpec :[ livelock free ]
+
+-- Design --------------------------------
+
+channel create, close: ConnSet
+channel start_link: ConnSet.ThreadId
+channel end_link: ConnSet.ThreadId.{ok,error}
+
+--------- Connections --------
+ConnInterface = {|create, close, start_link, end_link|}
+
+DIV = STOP |~| DIV
+
+ConnError(c) = [] e: {|close.c, start_link.c|}@ e -> DIV
+
+Connection(c) = create.c -> Active(c)
+                [] ConnError(c)
+
+Active(c) = close.c -> Connection(c)
+            [] start_link.c?t -> Linking(c, t)
+
+Linking(c, t) = end_link.c.t?_ ->Active(c)
+                [] ConnError(c)
+
+Connections = ||| c: ConnSet @ Connection(c)
+
+--------- Control --------
+
+channel allocate -- create a new connections
+channel reuse: ConnSet   -- reuse a pooled connection
+channel wait: ThreadId   -- suspend thread
+
+channel repool: ConnId -- this may be nil indicating that the connection is closed
+channel release        -- release the connection if not already closed
+channel pass: ThreadId -- pass the Connection to this thread
+
+ControlInterface = {|reject, allocate, reuse, wait, repool, release, pass|}
+
+Control(count, pool, queue) = 
+--
+  count >= 0  and
+  #pool <= pool_size and
+  #queue <= queue_size and
+  count + #pool <= max_conn and
+  ((count == max_conn and null(pool)) or null(queue)) &
+--
+  ((not null(pool) & let front^<last> = pool within
+    STOP |~| close!last -> Control(count, front, queue))
+  []         -- cases when requesting a connection
+  ( if count == max_conn
+    then if #queue < queue_size
+         then wait?t -> Control(count, pool, queue^<t>)
+         else reject -> Control(count, pool, queue)
+    else if null(pool)
+         then allocate -> Control(count+1, pool, queue)
+         else reuse!head(pool) ->
+              Control(count+1, tail(pool), queue)
+  )
+  []       -- cases when returning a connection
+  ( if null(queue)
+    then if #pool == pool_size
+         then release -> Control(count - 1, pool, queue)
+         else repool?c ->
+              if c == nil
+              then Control(count - 1, pool, queue)
+              else Control(count - 1, <c>^pool, queue)
+    else pass!head(queue) ->
+         Control(count, pool, tail(queue))))
+  
+--------- Dispatcher --------
+channel suspend: ThreadId
+channel resume, dispatch: ThreadId.ConnId
+
+Ready(t, c) = dispatch.t.c -> Ready(t, c)
+              [] suspend.t -> Suspended(t)
+              [] resume.t?c -> Resumed(t, c)
+
+Suspended(t) = resume.t?c -> Ready(t,c)
+               [] suspend.t -> DIV
+
+Resumed(t, c) = suspend.t -> Ready(t, c)
+               [] resume.t?_ -> DIV
+
+Dispatcher = ||| t: ThreadId @ Ready(t, nil)
+
+DispatchInterface = {|suspend, resume, dispatch|}
+
+Client(t) = call.t ->     -- caller initiates process
+  ( reject -> return.t!full -> Client(t)
+    [] wait.t -> suspend.t -> dispatch.t?c ->    -- suspend
+        ( if c != nil then Execute(t, c)  -- valid
+          else create?d -> Execute(t, d))  -- need new
+    [] allocate -> create?d -> Execute(t, d)  -- need new
+    [] reuse?c -> Execute(t, c)  -- connection from pool
+  )
+
+Execute(t, c) =  -- thread ahs valid connection c to use
+  start_link.c.t -> end_link.c.t?r -> --  link to target
+    if r == ok then Release(t, c, r)  -- retain connection
+    else close.c -> Release(t, nil, r)  -- close due to error
+
+Release(t, c, r) =
+  ( repool!c -> SKIP  -- c is back in pool, no more to do
+    [] release -> ( if c == nil then SKIP  -- already closed
+                    else close.c -> SKIP)   -- must close c
+    [] pass?u -> resume.u!c -> SKIP -- pass c to thread u
+  );
+  return.t!r -> Client(t)  -- return response to caller
+
+Clients = ||| t: ThreadId @ Client(t)
+
+DispatchClients = (Clients [|DispatchInterface|] Dispatcher) \ DispatchInterface
+
+ControlClients = (DispatchClients [|ControlInterface|] Control(0, <>, <>)) \ ControlInterface
+
+ConnClients = (ControlClients [|ConnInterface|] Connections) \ {|create, close, start_link|}
+
+PoolSystem = ConnClients [[end_link.c <- link | c <- ConnSet]]
+
+assert PoolSpec [FD= PoolSystem  -- todo Temporarily removed for reducing running time.
+
+-- Aren's Design --------------------------------
+
+-- CONNECTIONS
+channel a_create_req: ThreadId
+channel a_create_reply: ThreadId.ConnSet
+channel a_close: ConnSet
+channel a_start_link: ThreadId.ConnSet
+channel a_end_link_req: ThreadId.ConnSet
+channel a_end_link_reply: ThreadId.{ok, error}
+
+list_remove (x, xs) = <x' | x' <- xs, x != x>
+
+CONNECTIONS (conns, actives, linkings) = 
+  (a_create_req?t ->  if null (conns) then DIV else let
+                        c = head (conns)
+                        conns'   = tail (conns)
+                        actives' = <c>^actives
+                      within
+                        a_create_reply.t!c -> CONNECTIONS (conns', actives', linkings)
+  )
+  [] (a_close?c -> if elem (c, actives) then let
+                    actives' = list_remove (c, actives)
+                    conns'   = <c>^conns
+                  within
+                    CONNECTIONS (conns', actives', linkings)
+                  else DIV
+  )
+  [] (a_start_link?t.c -> if elem (c, actives) then let
+                    actives' = list_remove (c, actives)
+                    linkings' = <c>^linkings
+                  within
+                    CONNECTIONS (conns, actives', linkings')
+                  else DIV
+  )
+  [] (a_end_link_req?t.c -> if elem (c, linkings) then let
+                    linkings' = list_remove (c, linkings)
+                    actives' = <c>^actives
+                  within
+                    a_end_link_reply.t!ok -> CONNECTIONS (conns, actives', linkings')
+                  else DIV
+  )
+
+CONNECTIONS_INTERFACE = {|a_create_req, a_create_reply, a_close, a_start_link, a_end_link_req, a_end_link_reply|}
+CONNECTIONS_INTERFACE_INNER = {|a_create_req, a_create_reply, a_close, a_start_link, a_end_link_req|}
+
+CONNECTION1 = CONNECTIONS (seq(ConnSet), <>, <>)
+
+assert CONNECTION1 :[ deadlock free[F] ]
+assert CONNECTION1 :[ livelock free[F] ]
+-- CONTROL -----------------------
+
+datatype allocate_response = Reject | Wait | Allocate | Reuse.ConnSet
+datatype release_response = Done | Pass.ThreadId
+
+channel a_allocate_req: ThreadId
+channel a_allocate_reply: ThreadId.allocate_response
+channel a_release_req: ThreadId.Bool.ConnSet  -- connen may be null
+channel a_release_reply: ThreadId.release_response
+
+-- count: the number of connnection used
+-- pool: pool of created connections
+-- queue: queue of threads
+CONTROL (count, pool, queue) = 
+--
+  count >= 0  and
+  #pool <= pool_size and
+  #queue <= queue_size and
+  count + #pool <= max_conn and
+  ((count == max_conn and null(pool)) or null(queue)) &
+--
+  (
+  (a_allocate_req?t ->
+      if count == max_conn
+      then if #queue < queue_size
+           then a_allocate_reply.t!Wait -> CONTROL (count, pool, queue^<t>)
+           else a_allocate_reply.t!Reject -> CONTROL (count, pool, queue)
+      else if null(pool)
+           then a_allocate_reply.t!Allocate -> CONTROL (count + 1, pool, queue)
+           else let
+             c = head (pool)
+           within
+             a_allocate_reply.t!Reuse.c -> CONTROL (count + 1, tail (pool), queue)
+
+  )
+  []
+  (a_release_req?t.b.c -> 
+      if null (queue)
+      then if #pool == pool_size or b == false -- the pool is full or the connection needs to be recreated
+           then a_close!c -> a_release_reply.t!Done -> CONTROL (count - 1, pool, queue)
+           else a_release_reply.t!Done -> CONTROL (count - 1, <c>^pool, queue)
+      else a_release_reply.t!Pass.head(queue) -> CONTROL (count, pool, tail (queue))
+  )
+  )
+
+CONTROL_INTERFACE = {|a_allocate_req, a_allocate_reply, a_release_reply, a_release_req, a_release_reply|}
+
+CONTROL1 = CONTROL (0, <>, <>)
+assert CONTROL1 :[ deadlock free[F] ]
+assert CONTROL1 :[ livelock free[F] ]
+
+-- DISPATCHER ------------------------------------
+channel a_suspend: ThreadId
+channel a_resume: ThreadId.ConnId
+channel a_dispatch: ThreadId.ConnId
+
+find_t_in_resumeds (t, <(t, c)>^xs) = <(t, c)>
+find_t_in_resumeds (t, <x>^xs) = find_t_in_resumeds (t, xs)
+find_t_in_resumeds (t, <>) = <>
+
+DISPATCHER (readys, suspends, resumeds) =
+  (a_suspend?t -> 
+     if elem (t, readys)
+     then let
+       readys' = list_remove (t, readys)
+       suspends' = <t>^suspends
+     within
+       DISPATCHER (readys', suspends', resumeds) 
+     else let
+       tc = find_t_in_resumeds (t, resumeds)
+     within
+       if tc == <>
+       then DIV
+       else let
+         <(t', c)> = tc
+         resumeds' = list_remove ((t', c), resumeds)
+         readys' = <t'>^readys
+       within
+         a_dispatch.t!c -> DISPATCHER (readys', suspends, resumeds')
+  )
+  []
+  (a_resume?t.c ->
+     if elem (t, suspends)
+     then let
+       suspends' = list_remove (t, suspends)
+       readys' = <t>^readys
+     within
+       a_dispatch.t!c -> DISPATCHER (readys', suspends', resumeds)
+     else if elem (t, readys)
+          then let
+            readys' = list_remove (t, readys)
+            resumeds' = <(t, c)>^resumeds
+          within
+            DISPATCHER (readys', suspends, resumeds')
+          else DIV
+  )
+
+DISPATCHER_INTERFACE = {|a_suspend, a_resume, a_dispatch|}
+
+DISPATCHER1 = DISPATCHER (seq(ThreadId), <>, <>)
+assert DISPATCHER1 :[ deadlock free[F] ]
+assert DISPATCHER1 :[ livelock free[F] ]
+-- CLIENT ----------------------
+     
+CLIENT(t) = call.t -> a_allocate_req!t ->     -- caller initiates process
+            (
+             (a_allocate_reply.t.Reject -> return.t!full -> CLIENT (t))
+             []
+             (a_allocate_reply.t.Wait -> a_suspend!t -> 
+                      a_dispatch.t?c ->
+                      (if c != nil
+                       then EXECUTE (t, c)
+                       else a_create_req!t -> a_create_reply.t?d -> EXECUTE (t, d)
+                      )
+             )
+             []
+             (a_allocate_reply.t.Allocate -> a_create_req!t -> a_create_reply.t?c -> EXECUTE (t, c))
+             []
+             (a_allocate_reply.t.Reuse?c -> EXECUTE (t, c))
+            )
+
+EXECUTE (t, c) = 
+  a_start_link!t.c -> 
+  a_end_link_req!t.c -> 
+  a_end_link_reply.t?ret ->
+  RELEASE (t, c, ret)
+
+release_response_get_t (Pass.t@@x) = t
+RELEASE (t, c, ret) =
+  (
+  if ret == ok
+  then a_release_req!t.true.c -> SKIP
+  else a_release_req!t.false.c -> SKIP
+  );
+  (a_release_reply.t?rep ->
+    if rep == Done
+    then SKIP
+    else let
+      t' = release_response_get_t (rep)
+    within
+      if ret == ok
+      then a_resume!t'.c -> SKIP
+      else a_resume!t'.nil -> SKIP  -- connection has been closed
+  );
+  return.t!ret -> CLIENT (t)
+
+-------------------------------------------- 
+
+CLIENT1 = CLIENT (1)
+assert CLIENT1 :[ deadlock free[F] ]
+assert CLIENT1 :[ livelock free[F] ]
+
+CLIENTS = ||| t: ThreadId @ CLIENT (t)
+
+DISPATCHER_CLIENTS = (CLIENTS [|DISPATCHER_INTERFACE|] DISPATCHER (seq(ThreadId), <>, <>) ) \ DISPATCHER_INTERFACE
+
+CONTROL_CLIENTS = (DISPATCHER_CLIENTS [|CONTROL_INTERFACE|] CONTROL(0, <>, <>)) \ CONTROL_INTERFACE
+
+CONNECTION_CLIENTS = (CONTROL_CLIENTS [|CONNECTIONS_INTERFACE|] CONNECTIONS(seq(ConnSet), <>, <>)) \ CONNECTIONS_INTERFACE_INNER
+
+POOL_SYSTEM = CONNECTION_CLIENTS [[a_end_link_reply <- link]]
+
+assert PoolSpec [T= POOL_SYSTEM
+-- assert PoolSpec [FD= POOL_SYSTEM
+
+
+-- -----------------------------------------------
+
+-- PoolSpec2 = call.3 -> return.3.full -> PoolSpec2
+-- PoolSpec3 = call.1 -> return.1.full -> call.2 -> return.1.full -> PoolSpec3
+-- 
+-- assert PoolSpec3 [FD= PoolSpec2
+-- assert PoolSpec2 [FD= PoolSpec3
+-- -- ======================================================================
+-- assert PoolSpec [T= PoolSpec2
+-- assert PoolSpec2 [T= PoolSpec
+-- 
+-- 
+-- 
+-- 
+-- -- todo test
+-- channel aa, bb
+-- channel cc: {1, 2}
+-- 
+-- P1 = aa -> bb -> P1
+-- P2 = aa -> P2
+-- P3 = P1 \ {|bb|}
+-- 
+-- assert P2 [T= P3
+-- assert P3 [T= P2
+-- 
+-- P10 = cc?_ -> bb -> P10
+-- P11 = cc!1 -> bb -> SKIP
+-- assert P10 [T= P11
+-- assert P11 [T= P10
+
+
+
+
+
+
+
+
+

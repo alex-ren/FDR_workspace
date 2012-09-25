@@ -1,0 +1,21 @@
+scope = {1 .. 3}
+channel c: scope
+-- 
+-- myseq = {<x,y> | x<- scope, y <- scope}
+-- 
+-- P1 = c? x -> SKIP
+-- P2 = c? x -> SKIP
+-- P3 = c! 1 -> SKIP
+-- 
+-- 
+PP = STOP
+QQ = SKIP
+assert PP [= QQ
+assert 1 == 2
+-- 
+-- P (x) = c!x -> SKIP
+-- print 1
+-- -- P (<x>^s) = reverse(s)^x
+-- 
+-- -- assert P(<1,2,3>) = <3,2>
+
