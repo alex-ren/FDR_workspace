@@ -44,7 +44,7 @@ Supervisor(active, queue) =
         else enter?t -> Supervisor(active, queue^<t>))
   []
   ([]t: active@ -- active threads only
-        link.t?_ -> Supervisor(active, queue)
+        link.t!ok -> Supervisor(active, queue)
         [] exit.t -> let
              left = diff(active, {t}) 
            within
@@ -182,6 +182,7 @@ ConnClients = (ControlClients [|ConnInterface|] Connections) \ {|create, close, 
 PoolSystem = ConnClients [[end_link.c <- link | c <- ConnSet]]
 
 assert PoolSpec [FD= PoolSystem  -- todo Temporarily removed for reducing running time.
+assert PoolSystem :[ deadlock free[F] ]
 
 -- Aren's Design --------------------------------
 
@@ -193,7 +194,7 @@ channel a_start_link: ThreadId.ConnSet
 channel a_end_link_req: ThreadId.ConnSet
 channel a_end_link_reply: ThreadId.{ok, error}
 
-list_remove (x, xs) = <x' | x' <- xs, x != x>
+list_remove (x, xs) = <x' | x' <- xs, x != x'>
 
 CONNECTIONS (conns, actives, linkings) = 
   (a_create_req?t ->  if null (conns) then DIV else let
@@ -210,7 +211,9 @@ CONNECTIONS (conns, actives, linkings) =
                     CONNECTIONS (conns', actives', linkings)
                   else DIV
   )
-  [] (a_start_link?t.c -> if elem (c, actives) then let
+  [] (a_start_link?t.c ->
+                  if elem (c, actives) 
+                  then let
                     actives' = list_remove (c, actives)
                     linkings' = <c>^linkings
                   within
@@ -288,9 +291,14 @@ channel a_suspend: ThreadId
 channel a_resume: ThreadId.ConnId
 channel a_dispatch: ThreadId.ConnId
 
-find_t_in_resumeds (t, <(t, c)>^xs) = <(t, c)>
-find_t_in_resumeds (t, <x>^xs) = find_t_in_resumeds (t, xs)
-find_t_in_resumeds (t, <>) = <>
+find_t_in_resumeds (t, xs) = let
+  xs' = <(t', c) | (t', c) <- xs, t' == t>
+within
+  if xs' == <>
+  then <>
+  else <head(xs')>
+
+channel print_ts: Seq (ThreadId) -- just for debugging
 
 DISPATCHER (readys, suspends, resumeds) =
   (a_suspend?t -> 
@@ -310,7 +318,7 @@ DISPATCHER (readys, suspends, resumeds) =
          resumeds' = list_remove ((t', c), resumeds)
          readys' = <t'>^readys
        within
-         a_dispatch.t!c -> DISPATCHER (readys', suspends, resumeds')
+         a_dispatch.t'!c -> DISPATCHER (readys', suspends, resumeds')
   )
   []
   (a_resume?t.c ->
@@ -393,9 +401,11 @@ CONTROL_CLIENTS = (DISPATCHER_CLIENTS [|CONTROL_INTERFACE|] CONTROL(0, <>, <>)) 
 CONNECTION_CLIENTS = (CONTROL_CLIENTS [|CONNECTIONS_INTERFACE|] CONNECTIONS(seq(ConnSet), <>, <>)) \ CONNECTIONS_INTERFACE_INNER
 
 POOL_SYSTEM = CONNECTION_CLIENTS [[a_end_link_reply <- link]]
+assert POOL_SYSTEM :[ deadlock free[FD] ]
+assert POOL_SYSTEM :[ livelock free[FD] ]
 
 assert PoolSpec [T= POOL_SYSTEM
--- assert PoolSpec [FD= POOL_SYSTEM
+assert PoolSpec [F= POOL_SYSTEM
 
 
 -- -----------------------------------------------
